@@ -273,15 +273,16 @@ def validate_catalogs_structure():
             os.remove(temp_validator_path)
 
 
-# JSON Schema keywords whose values are subschemas, grouped by shape. The
-# identifier walk in validate_catalogs_identifiers descends through these and
-# nothing else. `properties` is handled separately because its keys are the
-# names under test.
+# JSON Schema keywords whose values are subschemas, grouped by shape: draft
+# 2020-12 plus the legacy names ajv still evaluates under `--spec=draft2020`
+# (`definitions`, `dependencies`, `additionalItems`).
 SUBSCHEMA_MAP_KEYWORDS = (
+    "properties",
     "$defs",
     "definitions",
     "patternProperties",
     "dependentSchemas",
+    "dependencies",
 )
 SUBSCHEMA_LIST_KEYWORDS = ("allOf", "anyOf", "oneOf", "prefixItems")
 SUBSCHEMA_KEYWORDS = (
@@ -292,11 +293,59 @@ SUBSCHEMA_KEYWORDS = (
     "unevaluatedItems",
     "contains",
     "propertyNames",
+    "contentSchema",
     "not",
     "if",
     "then",
     "else",
 )
+
+
+def iter_subschemas(schema):
+    """
+    Yields `(pointer, subschema)` for every direct subschema of `schema`, where
+    `pointer` is the JSON Pointer segment(s) from `schema` to it (for example
+    `properties/child` or `allOf/1`).
+
+    Only JSON Schema subschema positions are followed. Annotation values such as
+    `metadata` (`ComponentDefinition.metadata.extensions` is opaque vendor JSON
+    per common_types.json's `Extensions`), `description`, `examples`, `const`
+    or `default` are data, not schema, and are not descended into.
+    """
+    if not isinstance(schema, dict):
+        return
+    for keyword in SUBSCHEMA_MAP_KEYWORDS:
+        value = schema.get(keyword)
+        if isinstance(value, dict):
+            for key, sub in value.items():
+                if isinstance(sub, dict):
+                    yield f"{keyword}/{key}", sub
+    for keyword in SUBSCHEMA_LIST_KEYWORDS:
+        value = schema.get(keyword)
+        if isinstance(value, list):
+            for i, sub in enumerate(value):
+                if isinstance(sub, dict):
+                    yield f"{keyword}/{i}", sub
+    for keyword in SUBSCHEMA_KEYWORDS:
+        sub = schema.get(keyword)
+        if isinstance(sub, dict):
+            yield keyword, sub
+
+
+def invalid_property_names(schema):
+    """
+    Returns the keys of every `properties` object reachable from `schema`
+    through subschema positions that are not UAX #31 identifiers.
+    """
+    names = []
+    if not isinstance(schema, dict):
+        return names
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        names.extend(name for name in properties if not name.isidentifier())
+    for _, sub in iter_subschemas(schema):
+        names.extend(invalid_property_names(sub))
+    return names
 
 
 def validate_catalogs_identifiers():
@@ -333,32 +382,9 @@ def validate_catalogs_identifiers():
 
         errors = []
 
-        # The naming rule applies to the names a catalog declares, so the walk
-        # follows JSON Schema subschema positions only. Annotation values such
-        # as `metadata.extensions` (opaque vendor JSON per common_types.json's
-        # `Extensions`), `description` or `examples` are data, not schema, and
-        # a `properties` object inside them is not a declaration.
         def check_schema_properties(schema):
-            if not isinstance(schema, dict):
-                return
-            properties = schema.get("properties")
-            if isinstance(properties, dict):
-                for prop_name, prop_def in properties.items():
-                    if not prop_name.isidentifier():
-                        errors.append(f"Invalid argument/property name: '{prop_name}'")
-                    check_schema_properties(prop_def)
-            for keyword in SUBSCHEMA_MAP_KEYWORDS:
-                value = schema.get(keyword)
-                if isinstance(value, dict):
-                    for sub in value.values():
-                        check_schema_properties(sub)
-            for keyword in SUBSCHEMA_LIST_KEYWORDS:
-                value = schema.get(keyword)
-                if isinstance(value, list):
-                    for sub in value:
-                        check_schema_properties(sub)
-            for keyword in SUBSCHEMA_KEYWORDS:
-                check_schema_properties(schema.get(keyword))
+            for prop_name in invalid_property_names(schema):
+                errors.append(f"Invalid argument/property name: '{prop_name}'")
 
         components = catalog.get("components", {})
         for comp_name, comp_def in components.items():
@@ -381,6 +407,70 @@ def validate_catalogs_identifiers():
                 print(f"         {err}")
         else:
             passed += 1
+
+    return passed, failed
+
+
+# Synthetic schemas that pin down where the identifier walk does and does not
+# look. The shipped catalogs only ever carry valid names, so without these a
+# keyword dropped from the SUBSCHEMA_* tuples would go unnoticed.
+IDENTIFIER_WALK_CASES = [
+    (
+        "hyphenated property name is refused",
+        {"properties": {"x-y": {}}},
+        ["x-y"],
+    ),
+    (
+        "name under allOf -> items -> properties is refused",
+        {"allOf": [{"items": {"properties": {"a-b": {}}}}]},
+        ["a-b"],
+    ),
+    (
+        "function argument name is refused",
+        {"properties": {"args": {"properties": {"x-y": {}}}}},
+        ["x-y"],
+    ),
+    (
+        "name under a declared property called metadata is refused",
+        {"properties": {"metadata": {"properties": {"x-y": {}}}}},
+        ["x-y"],
+    ),
+    (
+        "name under legacy dependencies is refused",
+        {"dependencies": {"p": {"properties": {"x-y": {}}}}},
+        ["x-y"],
+    ),
+    (
+        "name inside metadata.extensions is not a declaration",
+        {"metadata": {"extensions": {"v": {"properties": {"x-y": {}}}}}},
+        [],
+    ),
+    (
+        "name inside examples is not a declaration",
+        {"examples": [{"properties": {"x-y": {}}}]},
+        [],
+    ),
+]
+
+
+def validate_identifier_walk():
+    """
+    Runs the identifier walk over IDENTIFIER_WALK_CASES and checks that it
+    reports exactly the expected invalid names.
+    """
+    passed = 0
+    failed = 0
+
+    print("\nChecking the identifier walk against synthetic schemas...")
+
+    for description, schema, expected in IDENTIFIER_WALK_CASES:
+        actual = invalid_property_names(schema)
+        if actual == expected:
+            passed += 1
+        else:
+            failed += 1
+            print(f"  [FAIL] {description}")
+            print(f"         expected {expected}, got {actual}")
 
     return passed, failed
 
@@ -610,12 +700,17 @@ def main():
         total_passed += p
         total_failed += f
 
-        # 5. Validate sample.json schema integrity and references
+        # 5. Check the identifier walk against synthetic schemas
+        p, f = validate_identifier_walk()
+        total_passed += p
+        total_failed += f
+
+        # 6. Validate sample.json schema integrity and references
         p, f = validate_sample_schema()
         total_passed += p
         total_failed += f
 
-        # 6. Validate A2A capability and message list schemas
+        # 7. Validate A2A capability and message list schemas
         p, f = validate_a2a_schemas()
         total_passed += p
         total_failed += f
