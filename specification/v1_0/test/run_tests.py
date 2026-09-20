@@ -275,7 +275,7 @@ def validate_catalogs_structure():
 
 # JSON Schema keywords whose values are subschemas, grouped by shape: draft
 # 2020-12 plus the legacy names ajv still evaluates under `--spec=draft2020`
-# (`definitions`, `dependencies`, `additionalItems`).
+# (`definitions`, `dependencies`).
 SUBSCHEMA_MAP_KEYWORDS = (
     "properties",
     "$defs",
@@ -289,7 +289,6 @@ SUBSCHEMA_KEYWORDS = (
     "items",
     "additionalProperties",
     "unevaluatedProperties",
-    "additionalItems",
     "unevaluatedItems",
     "contains",
     "propertyNames",
@@ -413,8 +412,43 @@ def validate_catalogs_identifiers():
 
 # Synthetic schemas that pin down where the identifier walk does and does not
 # look. The shipped catalogs only ever carry valid names, so without these a
-# keyword dropped from the SUBSCHEMA_* tuples would go unnoticed.
-IDENTIFIER_WALK_CASES = [
+# keyword dropped from the SUBSCHEMA_* tuples would go unnoticed: the first
+# group places an invalid name under every keyword the walk must follow, spelled
+# out here rather than derived from the tuples so that a dropped keyword still
+# has a case.
+INVALID_NAME_SCHEMA = {"properties": {"x-y": {}}}
+IDENTIFIER_WALK_CASES = (
+    [
+        (f"name under {kw} is refused", {kw: {"k": INVALID_NAME_SCHEMA}}, ["x-y"])
+        for kw in (
+            "$defs",
+            "definitions",
+            "patternProperties",
+            "dependentSchemas",
+            "dependencies",
+        )
+    ]
+    + [
+        (f"name under {kw} is refused", {kw: [INVALID_NAME_SCHEMA]}, ["x-y"])
+        for kw in ("allOf", "anyOf", "oneOf", "prefixItems")
+    ]
+    + [
+        (f"name under {kw} is refused", {kw: INVALID_NAME_SCHEMA}, ["x-y"])
+        for kw in (
+            "items",
+            "additionalProperties",
+            "unevaluatedProperties",
+            "unevaluatedItems",
+            "contains",
+            "propertyNames",
+            "contentSchema",
+            "not",
+            "if",
+            "then",
+            "else",
+        )
+    ]
+) + [
     (
         "hyphenated property name is refused",
         {"properties": {"x-y": {}}},
@@ -433,11 +467,6 @@ IDENTIFIER_WALK_CASES = [
     (
         "name under a declared property called metadata is refused",
         {"properties": {"metadata": {"properties": {"x-y": {}}}}},
-        ["x-y"],
-    ),
-    (
-        "name under legacy dependencies is refused",
-        {"dependencies": {"p": {"properties": {"x-y": {}}}}},
         ["x-y"],
     ),
     (
