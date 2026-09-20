@@ -273,6 +273,32 @@ def validate_catalogs_structure():
             os.remove(temp_validator_path)
 
 
+# JSON Schema keywords whose values are subschemas, grouped by shape. The
+# identifier walk in validate_catalogs_identifiers descends through these and
+# nothing else. `properties` is handled separately because its keys are the
+# names under test.
+SUBSCHEMA_MAP_KEYWORDS = (
+    "$defs",
+    "definitions",
+    "patternProperties",
+    "dependentSchemas",
+)
+SUBSCHEMA_LIST_KEYWORDS = ("allOf", "anyOf", "oneOf", "prefixItems")
+SUBSCHEMA_KEYWORDS = (
+    "items",
+    "additionalProperties",
+    "unevaluatedProperties",
+    "additionalItems",
+    "unevaluatedItems",
+    "contains",
+    "propertyNames",
+    "not",
+    "if",
+    "then",
+    "else",
+)
+
+
 def validate_catalogs_identifiers():
     """
     Validates that all entity keys (components, functions) in all catalog files
@@ -307,23 +333,32 @@ def validate_catalogs_identifiers():
 
         errors = []
 
-        def check_schema_properties(obj):
-            if isinstance(obj, dict):
-                if "properties" in obj and isinstance(obj["properties"], dict):
-                    for prop_name, prop_def in obj["properties"].items():
-                        if not prop_name.isidentifier():
-                            errors.append(
-                                f"Invalid argument/property name: '{prop_name}'"
-                            )
-                        check_schema_properties(prop_def)
-                for k, v in obj.items():
-                    if k != "properties":
-                        if isinstance(v, (dict, list)):
-                            check_schema_properties(v)
-            elif isinstance(obj, list):
-                for item in obj:
-                    if isinstance(item, (dict, list)):
-                        check_schema_properties(item)
+        # The naming rule applies to the names a catalog declares, so the walk
+        # follows JSON Schema subschema positions only. Annotation values such
+        # as `metadata.extensions` (opaque vendor JSON per common_types.json's
+        # `Extensions`), `description` or `examples` are data, not schema, and
+        # a `properties` object inside them is not a declaration.
+        def check_schema_properties(schema):
+            if not isinstance(schema, dict):
+                return
+            properties = schema.get("properties")
+            if isinstance(properties, dict):
+                for prop_name, prop_def in properties.items():
+                    if not prop_name.isidentifier():
+                        errors.append(f"Invalid argument/property name: '{prop_name}'")
+                    check_schema_properties(prop_def)
+            for keyword in SUBSCHEMA_MAP_KEYWORDS:
+                value = schema.get(keyword)
+                if isinstance(value, dict):
+                    for sub in value.values():
+                        check_schema_properties(sub)
+            for keyword in SUBSCHEMA_LIST_KEYWORDS:
+                value = schema.get(keyword)
+                if isinstance(value, list):
+                    for sub in value:
+                        check_schema_properties(sub)
+            for keyword in SUBSCHEMA_KEYWORDS:
+                check_schema_properties(schema.get(keyword))
 
         components = catalog.get("components", {})
         for comp_name, comp_def in components.items():
