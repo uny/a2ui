@@ -15,10 +15,12 @@
 
 
 import json
+import re
 import subprocess
 import os
 import glob
 import sys
+from urllib.parse import unquote
 
 # Constants
 TEST_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -504,6 +506,306 @@ def validate_identifier_walk():
     return passed, failed
 
 
+# The closed list from docs/a2ui_protocol.md, "Catalog Schema Rules and
+# Conventions", rule 3 "Restricted `$ref` Targets". validate_ref_target_walk
+# checks that this set and the document agree.
+ALLOWED_EXTERNAL_REF_TARGETS = {
+    "ComponentId",
+    "Child",
+    "ChildList",
+    "DynamicString",
+    "DynamicNumber",
+    "DynamicBoolean",
+    "DynamicStringList",
+    "DynamicValue",
+    "AccessibilityAttributes",
+    "CheckRule",
+    "Checkable",
+    "Action",
+    "DataBinding",
+    "FunctionCall",
+}
+LOCAL_REF_SECTIONS = ("components", "functions")
+EXTERNAL_REF_PREFIX = "common_types.json#/$defs/"
+PROTOCOL_DOC = os.path.join(SPEC_DIR, "docs/a2ui_protocol.md")
+RULE_3_LIST_MARKER = "Allowed `$ref` targets are limited to the following schemas:"
+
+
+def ref_target_error(target, catalog):
+    """
+    Returns why `target` violates rule 3 of the catalog schema rules, or None
+    if it is allowed: a local target must be exactly `#/components/<name>` or
+    `#/functions/<name>` for a `<name>` the catalog defines, and an external
+    target must be one of the listed common_types.json schemas.
+    """
+    if target.startswith("#"):
+        # A local target is a JSON Pointer in a URI fragment, so a name may be
+        # percent-encoded (`#/components/%E6%96%87%E6%9C%AC`); ajv resolves both.
+        section, _, name = unquote(target[2:]).partition("/")
+        definitions = catalog.get(section)
+        if (
+            target.startswith("#/")
+            and section in LOCAL_REF_SECTIONS
+            and isinstance(definitions, dict)
+            and name
+            and "/" not in name
+            and name in definitions
+        ):
+            return None
+        return "is not a top-level component or function"
+    if target.startswith(EXTERNAL_REF_PREFIX):
+        if target[len(EXTERNAL_REF_PREFIX) :] in ALLOWED_EXTERNAL_REF_TARGETS:
+            return None
+        return "is not an allowed common_types.json schema"
+    return "is neither local nor a common_types.json target"
+
+
+def collect_refs(schema, pointer):
+    """
+    Yields `(pointer, target)` for every `$ref` reachable from `schema` through
+    subschema positions (see iter_subschemas).
+    """
+    if not isinstance(schema, dict):
+        return
+    if isinstance(schema.get("$ref"), str):
+        yield pointer, schema["$ref"]
+    for segment, sub in iter_subschemas(schema):
+        yield from collect_refs(sub, f"{pointer}/{segment}")
+
+
+def catalog_ref_target_errors(catalog):
+    """
+    Returns `(pointer, target, reason)` for every `$ref` under the catalog's
+    `components`, `functions` and `$defs` that violates rule 3.
+    """
+    errors = []
+    for section in ("components", "functions", "$defs"):
+        definitions = catalog.get(section, {})
+        if not isinstance(definitions, dict):
+            continue
+        for name, definition in definitions.items():
+            for pointer, target in collect_refs(definition, f"/{section}/{name}"):
+                reason = ref_target_error(target, catalog)
+                if reason:
+                    errors.append((pointer, target, reason))
+    return errors
+
+
+def rule_3_targets_from_doc():
+    """
+    Reads the rule 3 allow-list out of docs/a2ui_protocol.md: the `Name`
+    bullets that follow RULE_3_LIST_MARKER, up to the next blank line.
+    """
+    with open(PROTOCOL_DOC, "r") as f:
+        lines = f.read().splitlines()
+    start = next(
+        (
+            i
+            for i, line in enumerate(lines)
+            if line.rstrip().endswith(RULE_3_LIST_MARKER)
+        ),
+        None,
+    )
+    if start is None:
+        return None
+    names = set()
+    for line in lines[start + 1 :]:
+        if not line.strip():
+            break
+        match = re.fullmatch(r"\s*-\s*`(\w+)`\s*", line)
+        if match:
+            names.add(match.group(1))
+    return names
+
+
+def validate_catalogs_ref_targets():
+    """
+    Validates every `$ref` in the catalog files against rule 3 of the catalog
+    schema rules (see ref_target_error).
+    """
+    catalogs_to_validate = [
+        (
+            "catalogs/basic/catalog.json",
+            os.path.join(SPEC_DIR, "catalogs/basic/catalog.json"),
+        ),
+        ("test/testing_catalog.json", os.path.join(TEST_DIR, "testing_catalog.json")),
+    ]
+
+    passed = 0
+    failed = 0
+
+    print("\nValidating catalog $ref targets against the rule 3 allow-list...")
+
+    for name, path in catalogs_to_validate:
+        if not os.path.exists(path):
+            print(f"  [FAIL] {name} (File not found)")
+            failed += 1
+            continue
+
+        with open(path, "r") as f:
+            try:
+                catalog = json.load(f)
+            except json.JSONDecodeError as e:
+                print(f"  [FAIL] {name} (JSON Decode Error: {e})")
+                failed += 1
+                continue
+
+        errors = catalog_ref_target_errors(catalog)
+        if errors:
+            failed += 1
+            print(f"  [FAIL] {name}")
+            for pointer, target, reason in errors:
+                print(f"         $ref '{target}' at {pointer} {reason}")
+        else:
+            passed += 1
+
+    return passed, failed
+
+
+# Synthetic catalogs that pin down what the $ref walk accepts and refuses. The
+# shipped catalogs only ever carry allowed targets, so without these a broken
+# check would still report them as passing. Each entry is
+# (description, catalog, pointers expected to be reported).
+OFF_LIST = "common_types.json#/$defs/Surface"
+REF_TARGET_WALK_CASES = [
+    (
+        "listed common_types.json schema is allowed",
+        {
+            "components": {
+                "X": {
+                    "properties": {"p": {"$ref": EXTERNAL_REF_PREFIX + "DynamicString"}}
+                }
+            }
+        },
+        [],
+    ),
+    (
+        "unlisted common_types.json schema is refused",
+        {"components": {"X": {"properties": {"p": {"$ref": OFF_LIST}}}}},
+        ["/components/X/properties/p"],
+    ),
+    (
+        "top-level component and function are allowed",
+        {
+            "components": {
+                "X": {},
+                "Y": {"properties": {"c": {"$ref": "#/components/X"}}},
+            },
+            "functions": {"f": {}, "g": {"allOf": [{"$ref": "#/functions/f"}]}},
+        },
+        [],
+    ),
+    (
+        "pointer into a component is refused",
+        {
+            "components": {
+                "X": {},
+                "Y": {"properties": {"c": {"$ref": "#/components/X/properties/p"}}},
+            }
+        },
+        ["/components/Y/properties/c"],
+    ),
+    (
+        "percent-encoded component name is allowed",
+        {
+            "components": {
+                "\u6587\u672c": {},
+                "Y": {"properties": {"c": {"$ref": "#/components/%E6%96%87%E6%9C%AC"}}},
+            }
+        },
+        [],
+    ),
+    (
+        "fragment without a leading slash is refused",
+        {
+            "components": {
+                "X": {},
+                "Y": {"properties": {"c": {"$ref": "#xcomponents/X"}}},
+            }
+        },
+        ["/components/Y/properties/c"],
+    ),
+    (
+        "undefined component is refused",
+        {"components": {"Y": {"properties": {"c": {"$ref": "#/components/X"}}}}},
+        ["/components/Y/properties/c"],
+    ),
+    (
+        "local $defs helper is refused",
+        {"components": {"X": {"properties": {"p": {"$ref": "#/$defs/helper"}}}}},
+        ["/components/X/properties/p"],
+    ),
+    (
+        "target in another file is refused",
+        {"components": {"X": {"properties": {"p": {"$ref": "other.json#/$defs/T"}}}}},
+        ["/components/X/properties/p"],
+    ),
+    (
+        "$defs.anyComponent is walked",
+        {
+            "components": {"X": {}},
+            "$defs": {"anyComponent": {"oneOf": [{"$ref": "#/components/Nope"}]}},
+        },
+        ["/$defs/anyComponent/oneOf/0"],
+    ),
+    (
+        "a declared property named metadata is walked",
+        {"components": {"X": {"properties": {"metadata": {"$ref": OFF_LIST}}}}},
+        ["/components/X/properties/metadata"],
+    ),
+    (
+        "metadata.extensions is not walked",
+        {"components": {"X": {"metadata": {"extensions": {"v": {"$ref": OFF_LIST}}}}}},
+        [],
+    ),
+    (
+        "a $ref key inside a literal value is data",
+        {"components": {"X": {"properties": {"p": {"const": {"$ref": OFF_LIST}}}}}},
+        [],
+    ),
+]
+
+
+def validate_ref_target_walk():
+    """
+    Checks that ALLOWED_EXTERNAL_REF_TARGETS matches the rule 3 list in
+    docs/a2ui_protocol.md, and runs the $ref walk over REF_TARGET_WALK_CASES.
+    """
+    passed = 0
+    failed = 0
+
+    print("\nChecking the $ref walk against the document and synthetic catalogs...")
+
+    doc_targets = rule_3_targets_from_doc()
+    if doc_targets == ALLOWED_EXTERNAL_REF_TARGETS:
+        passed += 1
+    else:
+        failed += 1
+        print(f"  [FAIL] rule 3 list in {os.path.relpath(PROTOCOL_DOC, SPEC_DIR)}")
+        if doc_targets is None:
+            print(f"         marker not found: {RULE_3_LIST_MARKER!r}")
+        else:
+            print(
+                "         only in document:"
+                f" {sorted(doc_targets - ALLOWED_EXTERNAL_REF_TARGETS)}"
+            )
+            print(
+                "         only in harness:"
+                f" {sorted(ALLOWED_EXTERNAL_REF_TARGETS - doc_targets)}"
+            )
+
+    for description, catalog, expected in REF_TARGET_WALK_CASES:
+        actual = [pointer for pointer, _, _ in catalog_ref_target_errors(catalog)]
+        if actual == expected:
+            passed += 1
+        else:
+            failed += 1
+            print(f"  [FAIL] {description}")
+            print(f"         expected {expected}, got {actual}")
+
+    return passed, failed
+
+
 def validate_sample_schema():
     """
     Validates that the sample.json schema is valid and can successfully
@@ -734,12 +1036,22 @@ def main():
         total_passed += p
         total_failed += f
 
-        # 6. Validate sample.json schema integrity and references
+        # 6. Validate catalog $ref targets against rule 3
+        p, f = validate_catalogs_ref_targets()
+        total_passed += p
+        total_failed += f
+
+        # 7. Check the $ref walk against the document and synthetic catalogs
+        p, f = validate_ref_target_walk()
+        total_passed += p
+        total_failed += f
+
+        # 8. Validate sample.json schema integrity and references
         p, f = validate_sample_schema()
         total_passed += p
         total_failed += f
 
-        # 7. Validate A2A capability and message list schemas
+        # 9. Validate A2A capability and message list schemas
         p, f = validate_a2a_schemas()
         total_passed += p
         total_failed += f
